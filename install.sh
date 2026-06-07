@@ -68,21 +68,31 @@ validate_port() {
     done
 }
 
-# URL 编码函数
+# URL 编码函数 (纯 bash 实现，无需 python3)
 urlencode() {
     local string="$1"
-    python3 -c "import urllib.parse; print(urllib.parse.quote('$string'))" 2>/dev/null || echo "$string"
+    local length=${#string}
+    local encoded=""
+    local i c o
+    for (( i = 0; i < length; i++ )); do
+        c="${string:i:1}"
+        case "$c" in
+            [a-zA-Z0-9.~_-]) encoded+="$c" ;;
+            *) printf -v o '%%%02X' "'$c"; encoded+="$o" ;;
+        esac
+    done
+    echo "$encoded"
 }
 
-# ---------- 依赖安装 ----------
+# ---------- 依赖安装 (精简版，适配容器环境) ----------
 install_packages() {
     echo "正在安装必要依赖..."
     if [ "$OS_TYPE" = "debian" ] || [ "$OS_TYPE" = "ubuntu" ]; then
         apt update -qq
-        apt install -y -qq wget curl sed sudo openssl net-tools psmisc procps iptables iproute2 ca-certificates jq qrencode >/dev/null 2>&1
+        apt install -y -qq wget curl openssl iptables iproute2 ca-certificates jq >/dev/null 2>&1
     elif [ "$OS_TYPE" = "centos" ] || [ "$OS_TYPE" = "rhel" ] || [ "$OS_TYPE" = "fedora" ] || [ "$OS_TYPE" = "rocky" ]; then
         yum install -y -q epel-release >/dev/null 2>&1
-        yum install -y -q wget curl sed sudo openssl net-tools psmisc procps-ng iptables iproute ca-certificates jq qrencode >/dev/null 2>&1
+        yum install -y -q wget curl openssl iptables iproute ca-certificates jq >/dev/null 2>&1
     else
         echo -e "${RED}不支持的操作系统。${RESET}"
         exit 1
@@ -90,39 +100,11 @@ install_packages() {
     echo -e "${GREEN}依赖安装完成${RESET}"
 }
 
-# ---------- 条款同意 ----------
-agree_treaty() {
-    local agree_file="$HY2_CONFIG_DIR/agree.txt"
-    if [ -f "$agree_file" ]; then
-        echo "你已经同意过条款，谢谢"
-        create_shortcut
-        return
-    fi
-
-    while true; do
-        echo "我同意使用本程序必须遵守部署服务器所在地、所在国家和用户所在国家的法律法规, 程序作者不对使用者任何不当行为负责。且本程序仅供学习交流使用，不得用于任何商业用途。"
-        read -p "是否同意并阅读(在上面)安装hysteria2相关条款 [y/n]：" choose
-        case "$choose" in
-            y|Y)
-                mkdir -p "$HY2_CONFIG_DIR"
-                touch "$agree_file"
-                touch "$HY2_URL_SCHEME"
-                create_shortcut
-                break
-                ;;
-            n|N)
-                echo "请同意此条款进行安装"
-                exit 0
-                ;;
-            *)
-                echo -e "${RED}请输入正确选项！${RESET}"
-                ;;
-        esac
-    done
-}
-
-# 创建 hy2 快捷方式 (来自 Python 版)
-create_shortcut() {
+# ---------- 环境初始化 (静默，无需用户交互) ----------
+init_env() {
+    mkdir -p "$HY2_CONFIG_DIR"
+    touch "$HY2_URL_SCHEME" 2>/dev/null
+    # 创建 hy2 快捷方式
     cat > /usr/local/bin/hy2 << 'SHORTCUT'
 #!/bin/bash
 wget -O hy2_install.sh https://raw.githubusercontent.com/seagullz4/hysteria2/main/install.sh && chmod +x hy2_install.sh && bash hy2_install.sh
@@ -130,54 +112,288 @@ SHORTCUT
     chmod 755 /usr/local/bin/hy2
 }
 
+# ---------- 网络自动优化 ----------
+# 自动启用最优拥塞控制算法 (BBR3 > BBR)，优化 UDP 缓冲区
+# 关闭 SYN cookies / CC-DDoS 轻量防护以减少开销
+auto_optimize_network() {
+    echo "正在配置网络优化..."
+
+    # 检测可用的拥塞控制算法，优先 BBR3 > BBR
+    local available_cc
+    available_cc=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)
+    local chosen_cc=""
+
+    if echo "$available_cc" | grep -qw "bbr3"; then
+        chosen_cc="bbr3"
+    elif echo "$available_cc" | grep -qw "bbr"; then
+        chosen_cc="bbr"
+    fi
+
+    # 应用 sysctl 优化
+    cat > /etc/sysctl.d/99-hysteria2.conf << SYSCTL
+# ===== Hysteria2 网络优化 =====
+# 拥塞控制: 使用 ${chosen_cc:-bbr} (最快)
+net.core.default_qdisc = fq
+${chosen_cc:+net.ipv4.tcp_congestion_control = $chosen_cc}
+
+# UDP 缓冲区优化 (Hysteria2 核心性能)
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+net.ipv4.udp_mem = 65536 131072 262144
+
+# TCP 缓冲区优化
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+
+# 关闭 CC/DDoS 轻量防护 (减少不必要占用)
+net.ipv4.tcp_syncookies = 0
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_max_syn_backlog = 65535
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 65535
+
+# 连接跟踪优化 (减少内存占用)
+net.netfilter.nf_conntrack_max = 65535
+net.netfilter.nf_conntrack_tcp_timeout_established = 1200
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
+SYSCTL
+
+    sysctl -p /etc/sysctl.d/99-hysteria2.conf >/dev/null 2>&1
+
+    if [ -n "$chosen_cc" ]; then
+        echo -e "${GREEN}拥塞控制: ${chosen_cc} ✓ | UDP缓冲区优化 ✓ | CC/DDoS防护已关闭 ✓${RESET}"
+    else
+        echo -e "${YELLOW}未检测到 BBR/BBR3，已应用其他优化。建议安装 xanmod 内核以获得 BBR3${RESET}"
+    fi
+}
+
 # ---------- 安装/更新 Hysteria2 ----------
-# 使用官方安装脚本 (来自 Python 版的改进)
 hysteria2_install() {
+    echo -e "${GREEN}正在安装/更新 Hysteria2 最新版本...${RESET}"
+    bash <(curl -fsSL https://get.hy2.sh/)
+    echo -e "${GREEN}Hysteria2 安装完成${RESET}"
+}
+
+# ---------- 一键快速安装 ----------
+# 自动: 安装最新版 + bing自签证书 + 获取IPv4/IPv6 + 随机密码
+# 交互: 端口号 + 端口跳跃
+quick_setup() {
+    echo ""
+    echo -e "${GREEN}========== Hysteria2 一键快速安装 ==========${RESET}"
+    echo ""
+
+    # 1. 安装 hysteria2
+    hysteria2_install
+
+    # 2. 生成 bing.com 自签证书
+    echo ""
+    echo -e "${GREEN}正在生成 bing.com 自签名证书...${RESET}"
+    local cert_domain="bing.com"
+    mkdir -p "$SSL_DIR"
+    openssl ecparam -name prime256v1 -out "$SSL_DIR/ec_param.pem" 2>/dev/null
+    openssl req -x509 -nodes -newkey "ec:$SSL_DIR/ec_param.pem" \
+        -keyout "$SSL_DIR/${cert_domain}.key" \
+        -out "$SSL_DIR/${cert_domain}.crt" \
+        -subj "/CN=${cert_domain}" -days 36500 2>/dev/null
+    chmod 644 "$SSL_DIR/${cert_domain}.key" "$SSL_DIR/${cert_domain}.crt"
+    chmod 755 "$SSL_DIR"
+    chown root:hysteria "$SSL_DIR/${cert_domain}.key" "$SSL_DIR/${cert_domain}.crt" 2>/dev/null
+    echo -e "${GREEN}证书已生成: $SSL_DIR/${cert_domain}.crt${RESET}"
+
+    # 3. 获取 IP 地址 (默认双栈, 优先IPv4作为主地址)
+    echo ""
+    echo "正在获取服务器 IP 地址..."
+    local ipv4_addr="" ipv6_addr=""
+
+    # 获取 IPv4
+    ipv4_addr=$(curl -4 -s --max-time 3 -A "Mozilla" http://ip-api.com/json/ 2>/dev/null | jq -r '.query // ""' 2>/dev/null)
+    if [ -z "$ipv4_addr" ]; then
+        ipv4_addr=$(curl -4 -s --max-time 5 ifconfig.me 2>/dev/null)
+    fi
+    if [ -n "$ipv4_addr" ] && validate_ipv4 "$ipv4_addr"; then
+        echo -e "${GREEN}IPv4: ${ipv4_addr}${RESET}"
+    else
+        ipv4_addr=""
+        echo -e "${YELLOW}未检测到 IPv4${RESET}"
+    fi
+
+    # 获取 IPv6 (默认开启)
+    ipv6_addr=$(curl -6 -s --max-time 3 -A "Mozilla" https://api.ip.sb/geoip 2>/dev/null | jq -r '.ip // ""' 2>/dev/null)
+    if [ -z "$ipv6_addr" ]; then
+        ipv6_addr=$(curl -6 -s --max-time 5 ifconfig.me 2>/dev/null)
+    fi
+    if [ -n "$ipv6_addr" ] && validate_ipv6 "$ipv6_addr"; then
+        echo -e "${GREEN}IPv6: ${ipv6_addr}${RESET}"
+    else
+        ipv6_addr=""
+        echo -e "${YELLOW}未检测到 IPv6${RESET}"
+    fi
+
+    # 确定主 IP (用于链接生成)
+    local hy2_domain=""
+    if [ -n "$ipv4_addr" ]; then
+        hy2_domain="$ipv4_addr"
+    elif [ -n "$ipv6_addr" ]; then
+        hy2_domain="[${ipv6_addr}]"
+    else
+        read -p "无法自动获取IP，请手动输入服务器IP地址：" hy2_domain
+    fi
+
+    # 4. 输入端口号
+    echo ""
+    local hy2_port
+    hy2_port=$(validate_port "请输入端口号 (1-65535)：")
+
+    # 5. 生成随机密码
+    local hy2_passwd
+    hy2_passwd=$(openssl rand -base64 20 | tr -dc 'a-zA-Z0-9' | head -c 16)
+    echo -e "${GREEN}已生成随机密码: ${hy2_passwd}${RESET}"
+
+    # 6. 端口跳跃
+    echo ""
+    local jump_ports_hy2=""
     while true; do
-        read -p "是否安装/更新hysteria2 [y/n]：" choice
-        case "$choice" in
+        read -p "是否开启端口跳跃(y/n)：" jump_port_choice
+        case "$jump_port_choice" in
             y|Y)
-                echo "1. 默认安装最新版本"
-                echo "2. 安装指定版本"
-                read -p "请输入选项：" sub_choice
-                case "$sub_choice" in
-                    1)
-                        # 使用官方脚本安装 (Python 版改进)
-                        bash <(curl -fsSL https://get.hy2.sh/)
-                        echo "--------------"
-                        echo -e "${RED}hysteria2安装完成,请进行配置一键修改${RESET}"
-                        echo "--------------"
-                        hysteria2_config
-                        break
-                        ;;
-                    2)
-                        read -p "请输入您需要安装的版本号(直接输入版本号数字即可，不需要加v，如2.6.0)：" ver
-                        # 版本号格式验证 (来自 Python 版)
-                        if ! echo "$ver" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-                            echo -e "${RED}版本号格式无效，请输入如 2.6.0 的格式${RESET}"
-                            continue
-                        fi
-                        bash <(curl -fsSL https://get.hy2.sh/) --version "v${ver}"
-                        echo "--------------"
-                        echo -e "${RED}hysteria2指定${ver}版本安装完成,请输入选项进行配置一键修改！！！${RESET}"
-                        echo "--------------"
-                        hysteria2_config
-                        break
-                        ;;
-                    *)
-                        echo -e "${RED}输入错误，请重新输入${RESET}"
-                        ;;
-                esac
-                ;;
-            n|N)
-                echo "已取消安装hysteria2"
+                echo "可用网络接口:"
+                ip -o link show | awk -F': ' '{print "  - "$2}'
+                read -p "请输入IPv4网络接口名称 (默认eth0)：" interface_name
+                interface_name=${interface_name:-eth0}
+
+                local first_port last_port
+                while true; do
+                    read -p "请输入起始端口号：" first_port
+                    read -p "请输入结束端口号：" last_port
+                    if ! [[ "$first_port" =~ ^[0-9]+$ ]] || ! [[ "$last_port" =~ ^[0-9]+$ ]]; then
+                        echo "端口号只能为数字，请重新输入"; continue
+                    fi
+                    if [ "$first_port" -lt 1 ] || [ "$first_port" -gt 65535 ] || [ "$last_port" -lt 1 ] || [ "$last_port" -gt 65535 ]; then
+                        echo "端口号范围为1~65535，请重新输入"; continue
+                    fi
+                    if [ "$first_port" -gt "$last_port" ]; then
+                        echo "起始端口号不能大于结束端口号，请重新输入"; continue
+                    fi
+                    break
+                done
+
+                # 清理旧规则
+                if [ -f "$HY2_CONFIG_DIR/jump_port_back.sh" ]; then
+                    bash "$HY2_CONFIG_DIR/jump_port_back.sh" 2>/dev/null
+                    rm -f "$HY2_CONFIG_DIR/jump_port_back.sh"
+                fi
+
+                # IPv4 iptables
+                iptables -t nat -A PREROUTING -i "$interface_name" \
+                    -p udp --dport "${first_port}:${last_port}" \
+                    -j REDIRECT --to-ports "$hy2_port"
+
+                # IPv6 iptables (默认开启)
+                local ipv6_interface="$interface_name"
+                if [ -n "$ipv6_addr" ]; then
+                    ip6tables -t nat -A PREROUTING -i "$ipv6_interface" \
+                        -p udp --dport "${first_port}:${last_port}" \
+                        -j REDIRECT --to-ports "$hy2_port"
+                    echo -e "${GREEN}IPv6 端口跳跃已开启${RESET}"
+                fi
+
+                # 创建清理脚本
+                mkdir -p "$HY2_CONFIG_DIR"
+                cat > "$HY2_CONFIG_DIR/jump_port_back.sh" << CLEANUP
+#!/bin/sh
+iptables -t nat -D PREROUTING -i ${interface_name} -p udp --dport ${first_port}:${last_port} -j REDIRECT --to-ports ${hy2_port}
+CLEANUP
+                if [ -n "$ipv6_addr" ]; then
+                    echo "ip6tables -t nat -D PREROUTING -i ${ipv6_interface} -p udp --dport ${first_port}:${last_port} -j REDIRECT --to-ports ${hy2_port}" >> "$HY2_CONFIG_DIR/jump_port_back.sh"
+                fi
+                chmod 755 "$HY2_CONFIG_DIR/jump_port_back.sh"
+
+                # 持久化
+                if save_iptables_rules; then
+                    create_iptables_persistence_service
+                    echo -e "${GREEN}端口跳跃已配置并持久化${RESET}"
+                fi
+
+                jump_ports_hy2="&mport=${first_port}-${last_port}"
                 break
                 ;;
-            *)
-                echo -e "${RED}输入错误，请重新输入${RESET}"
+            n|N)
+                jump_ports_hy2=""
+                break
                 ;;
+            *) echo -e "${RED}输入错误请重新输入${RESET}" ;;
         esac
     done
+
+    # 7. 写入配置文件
+    mkdir -p "$(dirname "$HY2_CONFIG")"
+    cat > "$HY2_CONFIG" << CONFIG
+listen: :${hy2_port}
+
+tls:
+  cert: ${SSL_DIR}/${cert_domain}.crt
+  key: ${SSL_DIR}/${cert_domain}.key
+
+auth:
+  type: password
+  password: ${hy2_passwd}
+
+masquerade:
+  type: proxy
+  proxy:
+    url: https://www.bing.com
+    rewriteHost: true
+
+ignoreClientBandwidth: false
+CONFIG
+
+    # 8. 生成链接
+    echo ""
+    local hy2_passwd_encoded
+    hy2_passwd_encoded=$(urlencode "$hy2_passwd")
+    local hy2_v2ray="hysteria2://${hy2_passwd_encoded}@${hy2_domain}:${hy2_port}?sni=${cert_domain}&insecure=1${jump_ports_hy2}#Hysteria2"
+
+    # 保存链接
+    mkdir -p "$HY2_CONFIG_DIR"
+    echo "${hy2_v2ray}" > "$HY2_URL_SCHEME"
+
+    # 显示二维码
+    if _exists qrencode; then
+        echo "v2ray 二维码："
+        echo "$hy2_v2ray" | qrencode -s 1 -m 1 -t ANSI256 -o - 2>/dev/null
+        echo ""
+    fi
+
+    echo -e "${GREEN}================================================${RESET}"
+    echo -e "${GREEN}  Hysteria2 安装配置完成！${RESET}"
+    echo -e "${GREEN}================================================${RESET}"
+    echo ""
+    echo -e "  端口:     ${hy2_port}"
+    echo -e "  密码:     ${hy2_passwd}"
+    echo -e "  IPv4:     ${ipv4_addr:-无}"
+    echo -e "  IPv6:     ${ipv6_addr:-无}"
+    echo -e "  证书:     bing.com 自签"
+    [ -n "$jump_ports_hy2" ] && echo -e "  端口跳跃: ${first_port}-${last_port}"
+    echo ""
+    echo -e "${RED}hy2链接: ${hy2_v2ray}${RESET}"
+    echo -e "请使用 v2ray/nekobox/v2rayNG/nekoray/surge 导入"
+    echo ""
+
+    # 如果有 IPv6，也生成一条 IPv6 链接
+    if [ -n "$ipv4_addr" ] && [ -n "$ipv6_addr" ]; then
+        local hy2_v2ray_v6="hysteria2://${hy2_passwd_encoded}@[${ipv6_addr}]:${hy2_port}?sni=${cert_domain}&insecure=1${jump_ports_hy2}#Hysteria2-IPv6"
+        echo -e "${RED}IPv6链接: ${hy2_v2ray_v6}${RESET}"
+        echo "${hy2_v2ray_v6}" >> "$HY2_URL_SCHEME"
+        echo ""
+    fi
+
+    # 9. 启动服务
+    systemctl enable --now hysteria-server.service 2>/dev/null
+    systemctl restart hysteria-server.service 2>/dev/null
+    echo -e "${GREEN}Hysteria2 服务已启动${RESET}"
 }
 
 # ---------- 卸载 Hysteria2 ----------
@@ -334,32 +550,64 @@ save_iptables_rules() {
 }
 
 # ---------- IP 获取函数 ----------
-# 来自 Python 版，增加了 Warp 检测和备用方案
+# Warp 检测和备用方案，纯 bash IP 验证
 
-# IPv4 地址验证
+# IPv4 地址验证 (纯 bash，无需 python3)
 validate_ipv4() {
     local ip="$1"
-    python3 -c "
-import ipaddress
-try:
-    ipaddress.IPv4Address('$ip')
-    exit(0)
-except:
-    exit(1)
-" 2>/dev/null
+    # 检查格式: 4组数字用点分隔，每组 0-255
+    if [[ ! "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        return 1
+    fi
+    local IFS='.'
+    local -a octets=($ip)
+    [ ${#octets[@]} -ne 4 ] && return 1
+    local octet
+    for octet in "${octets[@]}"; do
+        # 去除前导零后检查范围
+        if [ "$octet" -lt 0 ] 2>/dev/null || [ "$octet" -gt 255 ] 2>/dev/null; then
+            return 1
+        fi
+        # 纯数字检查 (防止空字段)
+        [[ ! "$octet" =~ ^[0-9]+$ ]] && return 1
+        [ "$octet" -gt 255 ] && return 1
+    done
+    return 0
 }
 
-# IPv6 地址验证
+# IPv6 地址验证 (纯 bash，无需 python3)
 validate_ipv6() {
     local ip="$1"
-    python3 -c "
-import ipaddress
-try:
-    ipaddress.IPv6Address('$ip')
-    exit(0)
-except:
-    exit(1)
-" 2>/dev/null
+    # 去除可能的方括号
+    ip="${ip#[}"
+    ip="${ip%]}"
+    # 基本格式检查: 只允许十六进制字符、冒号和一个可选的 ::
+    if [[ ! "$ip" =~ ^[0-9a-fA-F:]+$ ]]; then
+        return 1
+    fi
+    # 不允许超过一个 ::
+    local double_colon_count
+    double_colon_count=$(echo "$ip" | grep -o '::' | wc -l)
+    if [ "$double_colon_count" -gt 1 ]; then
+        return 1
+    fi
+    # 按冒号分割，检查组数 (无 :: 时应为8组，有 :: 时最多8组)
+    local IFS=':'
+    local -a groups=($ip)
+    if [ "$double_colon_count" -eq 0 ] && [ ${#groups[@]} -ne 8 ]; then
+        return 1
+    fi
+    if [ ${#groups[@]} -gt 8 ]; then
+        return 1
+    fi
+    # 检查每组长度不超过4个十六进制字符
+    local group
+    for group in "${groups[@]}"; do
+        if [ -n "$group" ] && [ ${#group} -gt 4 ]; then
+            return 1
+        fi
+    done
+    return 0
 }
 
 get_ipv4_info() {
@@ -491,7 +739,7 @@ hysteria2_config() {
         echo "1. hy2配置查看"
         echo "2. hy2配置一键修改"
         echo "3. 手动修改hy2配置"
-        echo "4. 性能优化(可选,推荐安装xanmod内核)"
+        echo "4. 网络优化(重新应用BBR/缓冲区优化)"
         echo "0. 返回"
         read -p "请输入选项：" choice
         case "$choice" in
@@ -899,16 +1147,21 @@ MANUAL_CERT_CONFIG
                 ;;
 
             3)
-                echo -e "${RED}正在使用nano编辑器进行手动修改，输入完成后按Ctrl+X保存退出${RESET}"
-                nano "$HY2_CONFIG"
+                if _exists nano; then
+                    echo -e "${RED}正在使用nano编辑器进行手动修改，输入完成后按Ctrl+X保存退出${RESET}"
+                    nano "$HY2_CONFIG"
+                else
+                    echo -e "${RED}正在使用vi编辑器进行手动修改，输入完成后按:wq保存退出${RESET}"
+                    vi "$HY2_CONFIG"
+                fi
                 systemctl enable --now hysteria-server.service
                 systemctl restart hysteria-server.service
                 echo "hy2服务已启动"
                 ;;
 
             4)
-                # 性能优化 (来自 Python 版)
-                wget -O tcpx.sh 'https://github.com/ylx2016/Linux-NetSpeed/raw/master/tcpx.sh' && chmod +x tcpx.sh && ./tcpx.sh
+                # 网络优化 (内置，无外部依赖)
+                auto_optimize_network
                 ;;
             0) break ;;
             *) echo -e "${RED}请重新输入${RESET}" ;;
@@ -932,21 +1185,26 @@ check_hysteria2_version() {
 # ============================================================
 
 install_packages
-agree_treaty
+init_env
+auto_optimize_network
 
 while true; do
     clear
     echo -e "${RED}HELLO HYSTERIA2 !${RESET}  (输入hy2快捷启动)"
-    echo "1. 安装/更新hysteria2"
+    check_hysteria2_version
+    echo ""
+    echo "1. 一键安装 (自动安装+bing证书+获取IP)"
     echo "2. 卸载hysteria2"
-    echo "3. hysteria2配置"
-    echo "4. hysteria2服务管理"
+    echo "3. 配置管理 (查看/修改/高级配置)"
+    echo "4. 服务管理 (启停/重启/日志)"
     echo "0. 退出"
     read -p "请输入选项：" main_choice
     case "$main_choice" in
         1)
             clear
-            hysteria2_install
+            quick_setup
+            echo ""
+            read -p "按回车键返回主菜单..." _
             ;;
         2)
             clear
