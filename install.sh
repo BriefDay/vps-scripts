@@ -257,6 +257,7 @@ quick_setup() {
     # 6. 端口跳跃
     echo ""
     local jump_ports_hy2=""
+    local native_listen_ports=""
     while true; do
         read -p "是否开启端口跳跃(y/n)：" jump_port_choice
         case "$jump_port_choice" in
@@ -296,7 +297,7 @@ quick_setup() {
                 if ! iptables -t nat -A PREROUTING -i "$interface_name" \
                     -p udp --dport "${first_port}:${last_port}" \
                     -j REDIRECT --to-ports "$hy2_port" 2>/dev/null; then
-                    echo -e "${RED}警告: 无法设置 iptables 规则 (可能是容器权限限制)。端口跳跃将不会生效。${RESET}"
+                    echo -e "${YELLOW}警告: 无法设置 iptables 规则 (可能是容器权限限制)。已自动回退到 Hysteria2 原生多端口监听机制。${RESET}"
                     iptables_ok=false
                 fi
 
@@ -331,7 +332,9 @@ CLEANUP
                     fi
                     jump_ports_hy2="&mport=${first_port}-${last_port}"
                 else
-                    jump_ports_hy2=""
+                    # 容器无权限，使用 Hysteria 原生多端口监听
+                    native_listen_ports=",:${first_port}-${last_port}"
+                    jump_ports_hy2="&mport=${first_port}-${last_port}"
                 fi
                 break
                 ;;
@@ -346,7 +349,7 @@ CLEANUP
     # 7. 写入配置文件
     mkdir -p "$(dirname "$HY2_CONFIG")"
     cat > "$HY2_CONFIG" << CONFIG
-listen: :${hy2_port}
+listen: :${hy2_port}${native_listen_ports}
 
 tls:
   cert: ${SSL_DIR}/${cert_domain}.crt
@@ -832,6 +835,7 @@ hysteria2_config() {
 
                 # --- 端口跳跃 ---
                 local jump_ports_hy2=""
+                local native_listen_ports=""
                 while true; do
                     read -p "是否开启端口跳跃(y/n)：" jump_port_choice
                     case "$jump_port_choice" in
@@ -892,14 +896,19 @@ hysteria2_config() {
                                 rm -f "$HY2_CONFIG_DIR/jump_port_back.sh"
                             fi
 
-                            # 应用 iptables 规则
-                            iptables -t nat -A PREROUTING -i "$interface_name" \
+                            # IPv4 iptables (尝试执行，并捕获错误)
+                            local iptables_ok=true
+                            if ! iptables -t nat -A PREROUTING -i "$interface_name" \
                                 -p udp --dport "${first_port}:${last_port}" \
-                                -j REDIRECT --to-ports "$hy2_port"
+                                -j REDIRECT --to-ports "$hy2_port" 2>/dev/null; then
+                                echo -e "${YELLOW}警告: 无法设置 iptables 规则 (可能是容器权限限制)。已自动回退到 Hysteria2 原生多端口监听机制。${RESET}"
+                                iptables_ok=false
+                            fi
 
-                            # 创建清理脚本 (来自 Python 版)
-                            mkdir -p "$HY2_CONFIG_DIR"
-                            cat > "$HY2_CONFIG_DIR/jump_port_back.sh" << CLEANUP
+                            if [ "$iptables_ok" = true ]; then
+                                # 创建清理脚本 (来自 Python 版)
+                                mkdir -p "$HY2_CONFIG_DIR"
+                                cat > "$HY2_CONFIG_DIR/jump_port_back.sh" << CLEANUP
 #!/bin/sh
 # Hysteria2 port hopping cleanup script
 iptables -t nat -D PREROUTING -i ${interface_name} -p udp --dport ${first_port}:${last_port} -j REDIRECT --to-ports ${hy2_port}
@@ -909,16 +918,21 @@ CLEANUP
                             fi
                             chmod 755 "$HY2_CONFIG_DIR/jump_port_back.sh"
 
-                            # iptables 持久化 (来自 Python 版新增)
-                            echo "正在保存iptables规则以实现重启后自动恢复..."
-                            if save_iptables_rules; then
-                                create_iptables_persistence_service
-                                echo -e "${GREEN}端口跳跃规则已配置并持久化，系统重启后将自动恢复${RESET}"
-                            else
-                                echo -e "${RED}警告：iptables规则已应用但持久化失败，系统重启后可能需要重新配置${RESET}"
-                            fi
+                                # iptables 持久化 (来自 Python 版新增)
+                                echo "正在保存iptables规则以实现重启后自动恢复..."
+                                if save_iptables_rules; then
+                                    create_iptables_persistence_service
+                                    echo -e "${GREEN}端口跳跃规则已配置并持久化，系统重启后将自动恢复${RESET}"
+                                else
+                                    echo -e "${RED}警告：iptables规则已应用但持久化失败，系统重启后可能需要重新配置${RESET}"
+                                fi
 
-                            jump_ports_hy2="&mport=${first_port}-${last_port}"
+                                jump_ports_hy2="&mport=${first_port}-${last_port}"
+                            else
+                                # 容器无权限，使用 Hysteria 原生多端口监听
+                                native_listen_ports=",:${first_port}-${last_port}"
+                                jump_ports_hy2="&mport=${first_port}-${last_port}"
+                            fi
                             break
                             ;;
                         n|N)
@@ -1000,7 +1014,7 @@ CLEANUP
 
                             # 写入配置文件
                             cat > "$HY2_CONFIG" << ACME_CONFIG
-listen: :${hy2_port}
+listen: :${hy2_port}${native_listen_ports}
 
 acme:
   domains:
@@ -1045,7 +1059,7 @@ ACME_CONFIG
                             insecure="&insecure=1"
 
                             cat > "$HY2_CONFIG" << SELF_SIGN_CONFIG
-listen: :${hy2_port}
+listen: :${hy2_port}${native_listen_ports}
 
 tls:
   cert: ${SSL_DIR}/${domain_name}.crt
@@ -1078,7 +1092,7 @@ SELF_SIGN_CONFIG
                             insecure="&insecure=0"
 
                             cat > "$HY2_CONFIG" << MANUAL_CERT_CONFIG
-listen: :${hy2_port}
+listen: :${hy2_port}${native_listen_ports}
 
 tls:
   cert: ${hy2_cert}
