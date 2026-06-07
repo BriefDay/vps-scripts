@@ -173,6 +173,8 @@ SYSCTL
 # ---------- 安装/更新 Hysteria2 ----------
 hysteria2_install() {
     echo -e "${GREEN}正在安装/更新 Hysteria2 最新版本...${RESET}"
+    # 设置默认终端类型，防止 tput 报错
+    export TERM=xterm
     bash <(curl -fsSL https://get.hy2.sh/)
     echo -e "${GREEN}Hysteria2 安装完成${RESET}"
 }
@@ -259,10 +261,13 @@ quick_setup() {
         read -p "是否开启端口跳跃(y/n)：" jump_port_choice
         case "$jump_port_choice" in
             y|Y)
-                echo "可用网络接口:"
-                ip -o link show | awk -F': ' '{print "  - "$2}'
-                read -p "请输入IPv4网络接口名称 (默认eth0)：" interface_name
-                interface_name=${interface_name:-eth0}
+                # 自动获取默认网卡
+                local interface_name
+                interface_name=$(ip route list default | awk 'NR==1 {print $5}')
+                if [ -z "$interface_name" ]; then
+                    interface_name="eth0"
+                fi
+                echo "自动检测到网络接口: $interface_name"
 
                 local first_port last_port
                 while true; do
@@ -286,38 +291,48 @@ quick_setup() {
                     rm -f "$HY2_CONFIG_DIR/jump_port_back.sh"
                 fi
 
-                # IPv4 iptables
-                iptables -t nat -A PREROUTING -i "$interface_name" \
+                # IPv4 iptables (尝试执行，并捕获错误)
+                local iptables_ok=true
+                if ! iptables -t nat -A PREROUTING -i "$interface_name" \
                     -p udp --dport "${first_port}:${last_port}" \
-                    -j REDIRECT --to-ports "$hy2_port"
-
-                # IPv6 iptables (默认开启)
-                local ipv6_interface="$interface_name"
-                if [ -n "$ipv6_addr" ]; then
-                    ip6tables -t nat -A PREROUTING -i "$ipv6_interface" \
-                        -p udp --dport "${first_port}:${last_port}" \
-                        -j REDIRECT --to-ports "$hy2_port"
-                    echo -e "${GREEN}IPv6 端口跳跃已开启${RESET}"
+                    -j REDIRECT --to-ports "$hy2_port" 2>/dev/null; then
+                    echo -e "${RED}警告: 无法设置 iptables 规则 (可能是容器权限限制)。端口跳跃将不会生效。${RESET}"
+                    iptables_ok=false
                 fi
 
-                # 创建清理脚本
-                mkdir -p "$HY2_CONFIG_DIR"
-                cat > "$HY2_CONFIG_DIR/jump_port_back.sh" << CLEANUP
+                if [ "$iptables_ok" = true ]; then
+                    # IPv6 iptables (默认开启)
+                    local ipv6_interface="$interface_name"
+                    if [ -n "$ipv6_addr" ]; then
+                        if ip6tables -t nat -A PREROUTING -i "$ipv6_interface" \
+                            -p udp --dport "${first_port}:${last_port}" \
+                            -j REDIRECT --to-ports "$hy2_port" 2>/dev/null; then
+                            echo -e "${GREEN}IPv6 端口跳跃已开启${RESET}"
+                        else
+                            echo -e "${YELLOW}警告: 无法设置 IPv6 端口跳跃。${RESET}"
+                        fi
+                    fi
+
+                    # 创建清理脚本
+                    mkdir -p "$HY2_CONFIG_DIR"
+                    cat > "$HY2_CONFIG_DIR/jump_port_back.sh" << CLEANUP
 #!/bin/sh
 iptables -t nat -D PREROUTING -i ${interface_name} -p udp --dport ${first_port}:${last_port} -j REDIRECT --to-ports ${hy2_port}
 CLEANUP
-                if [ -n "$ipv6_addr" ]; then
-                    echo "ip6tables -t nat -D PREROUTING -i ${ipv6_interface} -p udp --dport ${first_port}:${last_port} -j REDIRECT --to-ports ${hy2_port}" >> "$HY2_CONFIG_DIR/jump_port_back.sh"
-                fi
-                chmod 755 "$HY2_CONFIG_DIR/jump_port_back.sh"
+                    if [ -n "$ipv6_addr" ]; then
+                        echo "ip6tables -t nat -D PREROUTING -i ${ipv6_interface} -p udp --dport ${first_port}:${last_port} -j REDIRECT --to-ports ${hy2_port}" >> "$HY2_CONFIG_DIR/jump_port_back.sh"
+                    fi
+                    chmod 755 "$HY2_CONFIG_DIR/jump_port_back.sh"
 
-                # 持久化
-                if save_iptables_rules; then
-                    create_iptables_persistence_service
-                    echo -e "${GREEN}端口跳跃已配置并持久化${RESET}"
+                    # 持久化
+                    if save_iptables_rules; then
+                        create_iptables_persistence_service
+                        echo -e "${GREEN}端口跳跃已配置并持久化${RESET}"
+                    fi
+                    jump_ports_hy2="&mport=${first_port}-${last_port}"
+                else
+                    jump_ports_hy2=""
                 fi
-
-                jump_ports_hy2="&mport=${first_port}-${last_port}"
                 break
                 ;;
             n|N)
@@ -360,12 +375,7 @@ CONFIG
     mkdir -p "$HY2_CONFIG_DIR"
     echo "${hy2_v2ray}" > "$HY2_URL_SCHEME"
 
-    # 显示二维码
-    if _exists qrencode; then
-        echo "v2ray 二维码："
-        echo "$hy2_v2ray" | qrencode -s 1 -m 1 -t ANSI256 -o - 2>/dev/null
-        echo ""
-    fi
+    # 显示二维码 (已移除)
 
     echo -e "${GREEN}================================================${RESET}"
     echo -e "${GREEN}  Hysteria2 安装配置完成！${RESET}"
