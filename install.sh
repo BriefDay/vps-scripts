@@ -88,8 +88,8 @@ urlencode() {
 install_packages() {
     echo "正在安装必要依赖..."
     if [ "$OS_TYPE" = "debian" ] || [ "$OS_TYPE" = "ubuntu" ]; then
-        apt update -qq
-        apt install -y -qq wget curl openssl iptables iproute2 ca-certificates jq >/dev/null 2>&1
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get install -y -qq wget curl openssl iptables iproute2 ca-certificates jq >/dev/null 2>&1
     elif [ "$OS_TYPE" = "centos" ] || [ "$OS_TYPE" = "rhel" ] || [ "$OS_TYPE" = "fedora" ] || [ "$OS_TYPE" = "rocky" ]; then
         yum install -y -q epel-release >/dev/null 2>&1
         yum install -y -q wget curl openssl iptables iproute ca-certificates jq >/dev/null 2>&1
