@@ -149,6 +149,15 @@ masquerade:
 
 # 开启 BBR 拥塞控制，防 UDP QoS
 ignoreClientBandwidth: true
+
+# QUIC 连接调优：防止视频播放器缓冲间歇导致隧道断开
+quic:
+  initStreamReceiveWindow: 8388608
+  maxStreamReceiveWindow: 8388608
+  initConnReceiveWindow: 20971520
+  maxConnReceiveWindow: 20971520
+  maxIdleTimeout: 120s
+  keepAlivePeriod: 30s
 CONFIG
 
     # 7. 启动服务
