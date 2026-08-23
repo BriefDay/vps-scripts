@@ -38,34 +38,100 @@ install_packages() {
     fi
 }
 
+detect_memory_limit_bytes() {
+    local cgroup_root=${1:-/sys/fs/cgroup}
+    local memory_limit
+    memory_limit=$(cat "$cgroup_root/memory.max" 2>/dev/null || true)
+    if [[ "$memory_limit" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$memory_limit"
+    else
+        printf '0\n'
+    fi
+}
+
+quic_memory_profile() {
+    local memory_limit_bytes=${1:-0}
+    if [ "$memory_limit_bytes" -gt 0 ] && [ "$memory_limit_bytes" -le $((512 * 1024 * 1024)) ]; then
+        cat <<'PROFILE'
+  initStreamReceiveWindow: 2097152
+  maxStreamReceiveWindow: 4194304
+  initConnReceiveWindow: 8388608
+  maxConnReceiveWindow: 8388608
+PROFILE
+    else
+        cat <<'PROFILE'
+  initStreamReceiveWindow: 8388608
+  maxStreamReceiveWindow: 8388608
+  initConnReceiveWindow: 20971520
+  maxConnReceiveWindow: 20971520
+PROFILE
+    fi
+}
+
+apply_sysctl_setting() {
+    local key=$1 value=$2
+    if sysctl -w "$key=$value" >/dev/null 2>&1; then
+        return 0
+    fi
+    echo -e "${YELLOW}警告：当前环境不允许修改 ${key}，已跳过${RESET}" >&2
+    return 1
+}
+
 auto_optimize_network() {
     echo "正在配置网络优化 (BBR & UDP 缓冲区)..."
-    local available_cc=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)
-    local chosen_cc=""
-    if echo "$available_cc" | grep -qw "bbr3"; then chosen_cc="bbr3";
-    elif echo "$available_cc" | grep -qw "bbr"; then chosen_cc="bbr"; fi
+    local available_cc chosen_cc memory_limit
+    available_cc=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+    chosen_cc=""
+    if echo "$available_cc" | grep -qw "bbr3"; then chosen_cc="bbr3"
+    elif echo "$available_cc" | grep -qw "bbr"; then chosen_cc="bbr"
+    fi
 
+    memory_limit=$(detect_memory_limit_bytes)
     cat > /etc/sysctl.d/99-hysteria2.conf << SYSCTL
+# Values are best-effort; LXC containers may reject host-level sysctls.
 net.core.default_qdisc = fq
 ${chosen_cc:+net.ipv4.tcp_congestion_control = $chosen_cc}
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.core.rmem_default = 1048576
-net.core.wmem_default = 1048576
-net.ipv4.udp_mem = 65536 131072 262144
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
-net.ipv4.tcp_syncookies = 0
+net.core.rmem_max = 4194304
+net.core.wmem_max = 4194304
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
+net.ipv4.tcp_rmem = 4096 87380 4194304
+net.ipv4.tcp_wmem = 4096 65536 4194304
 net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_max_syn_backlog = 65535
-net.core.somaxconn = 65535
-net.core.netdev_max_backlog = 65535
+net.ipv4.tcp_fin_timeout = 30
+net.ipv4.tcp_max_syn_backlog = 4096
+net.core.somaxconn = 4096
 net.netfilter.nf_conntrack_max = 65535
 net.netfilter.nf_conntrack_tcp_timeout_established = 1200
 net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
 SYSCTL
-    sysctl -p /etc/sysctl.d/99-hysteria2.conf >/dev/null 2>&1
+
+    while IFS=' = ' read -r key value; do
+        [ -z "$key" ] || [[ "$key" == \#* ]] || [ -z "$value" ] || apply_sysctl_setting "$key" "$value" || true
+    done < /etc/sysctl.d/99-hysteria2.conf
+
+    if [ "$memory_limit" -gt 0 ] && [ "$memory_limit" -le $((512 * 1024 * 1024)) ]; then
+        echo -e "${YELLOW}检测到内存限制 $((memory_limit / 1024 / 1024)) MiB，将使用小内存 QUIC 配置${RESET}"
+    fi
+}
+
+check_service_health() {
+    local hy2_port=$1
+    if ! systemctl is-active --quiet hysteria-server.service; then
+        echo -e "${RED}服务启动失败，最近日志：${RESET}" >&2
+        journalctl --no-pager -u hysteria-server.service -n 20 >&2 || true
+        return 1
+    fi
+    local attempt
+    for attempt in 1 2 3 4 5; do
+        if ss -H -lun "sport = :$hy2_port" 2>/dev/null | grep -q ":$hy2_port"; then
+            echo -e "${GREEN}服务健康检查通过：UDP :$hy2_port 正在监听${RESET}"
+            return 0
+        fi
+        sleep 1
+    done
+    echo -e "${RED}服务已运行但未监听 UDP :$hy2_port${RESET}" >&2
+    return 1
 }
 
 urlencode() {
@@ -130,6 +196,8 @@ quick_setup() {
 
     # 6. 写配置
     mkdir -p /etc/hysteria
+    local memory_limit
+    memory_limit=$(detect_memory_limit_bytes)
     cat > "$HY2_CONFIG" << CONFIG
 listen: :${hy2_port}
 
@@ -150,19 +218,22 @@ masquerade:
 # 开启 BBR 拥塞控制，防 UDP QoS
 ignoreClientBandwidth: true
 
-# QUIC 连接调优：防止视频播放器缓冲间歇导致隧道断开
+# BBR 与 QUIC 并发调优：降低 256 MiB LXC 的 UDP 突发和内存压力
+congestion:
+  type: bbr
+  bbrProfile: standard
+
 quic:
-  initStreamReceiveWindow: 8388608
-  maxStreamReceiveWindow: 8388608
-  initConnReceiveWindow: 20971520
-  maxConnReceiveWindow: 20971520
+$(quic_memory_profile "$memory_limit")
   maxIdleTimeout: 120s
+  maxIncomingStreams: 128
   keepAlivePeriod: 30s
 CONFIG
 
     # 7. 启动服务
     systemctl enable --now hysteria-server.service >/dev/null 2>&1
     systemctl restart hysteria-server.service
+    check_service_health "$hy2_port" || return 1
 
     # 8. 生成链接
     local encoded_pw=$(urlencode "$hy2_passwd")
@@ -176,7 +247,7 @@ CONFIG
     echo -e "  IPv4: ${ipv4_addr:-无}"
     echo -e "  IPv6: ${ipv6_addr:-无}"
     echo -e "  证书: bing.com 自签"
-    echo -e "  QoS:  已彻底解决 (ignoreClientBandwidth=true)"
+    echo -e "  QUIC: 已按内存限制适配；ignoreClientBandwidth=true"
     echo ""
     echo -e "${RED}hy2 链接: ${link}${RESET}"
     if [ -n "$ipv4_addr" ] && [ -n "$ipv6_addr" ]; then
