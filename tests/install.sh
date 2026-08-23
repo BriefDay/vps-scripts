@@ -53,9 +53,16 @@ if grep -q 'QoS:  已彻底解决' "$script_dir/install.sh"; then
   exit 1
 fi
 
-assert_contains 'congestion:' "$(<"$script_dir/install.sh")" 'generated config selects explicit congestion control'
-assert_contains 'bbrProfile: standard' "$(<"$script_dir/install.sh")" 'generated config uses the validated BBR profile'
+assert_contains 'ignoreClientBandwidth: false' "$(<"$script_dir/install.sh")" 'generated config permits client Brutal bandwidth negotiation'
+assert_contains 'bandwidth:' "$(<"$script_dir/install.sh")" 'generated config declares a Brutal bandwidth profile'
+assert_contains '  up: 150 mbps' "$(<"$script_dir/install.sh")" 'generated config caps client download at 150 Mbps'
+assert_contains '  down: 100 mbps' "$(<"$script_dir/install.sh")" 'generated config caps client upload at 100 Mbps'
+assert_contains 'disableLossCompensation: true' "$(<"$script_dir/install.sh")" 'generated config disables Brutal loss compensation'
+assert_contains 'congestion:' "$(<"$script_dir/install.sh")" 'generated config retains explicit BBR fallback control'
+assert_contains 'bbrProfile: standard' "$(<"$script_dir/install.sh")" 'generated config retains the validated BBR fallback profile'
 assert_contains 'maxIncomingStreams: 128' "$(<"$script_dir/install.sh")" 'generated config limits concurrent QUIC streams'
+assert_contains 'download-bandwidth=150' "$(<"$script_dir/install.sh")" 'installer prints a Surge Brutal test-node field'
+assert_contains 'Surge 节点' "$(<"$script_dir/install.sh")" 'installer labels its Surge-specific output'
 
 fake_bin=$(mktemp -d)
 cat > "$fake_bin/systemctl" <<'FAKE_SYSTEMCTL'

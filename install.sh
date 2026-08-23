@@ -215,10 +215,14 @@ masquerade:
     url: https://www.bing.com
     rewriteHost: true
 
-# 开启 BBR 拥塞控制，防 UDP QoS
-ignoreClientBandwidth: true
+# Brutal 限速：在 256 MiB LXC 上降低 UDP 接收突发
+ignoreClientBandwidth: false
+bandwidth:
+  up: 150 mbps
+  down: 100 mbps
+  disableLossCompensation: true
 
-# BBR 与 QUIC 并发调优：降低 256 MiB LXC 的 UDP 突发和内存压力
+# 未声明客户端带宽时回退至 BBR
 congestion:
   type: bbr
   bbrProfile: standard
@@ -247,9 +251,11 @@ CONFIG
     echo -e "  IPv4: ${ipv4_addr:-无}"
     echo -e "  IPv6: ${ipv6_addr:-无}"
     echo -e "  证书: bing.com 自签"
-    echo -e "  QUIC: 已按内存限制适配；ignoreClientBandwidth=true"
+    echo -e "  QUIC: 已按内存限制适配；Brutal 下载限速 150 Mbps"
     echo ""
     echo -e "${RED}hy2 链接: ${link}${RESET}"
+    echo -e "${YELLOW}提示：通用 hy2 链接不含 Brutal 带宽参数；Surge 请使用下方节点。${RESET}"
+    echo -e "${RED}Surge 节点: Hysteria2 = hysteria2,${hy2_domain},${hy2_port},password=\"${hy2_passwd}\",sni=\"${cert_domain}\",skip-cert-verify=true,download-bandwidth=150${RESET}"
     if [ -n "$ipv4_addr" ] && [ -n "$ipv6_addr" ]; then
         local link_v6="hysteria2://${encoded_pw}@[${ipv6_addr}]:${hy2_port}?sni=${cert_domain}&insecure=1#Hysteria2-IPv6"
         echo -e "${RED}IPv6 链接: ${link_v6}${RESET}"
