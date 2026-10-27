@@ -31,10 +31,10 @@ install_packages() {
     if [[ "$OS_TYPE" == "debian" || "$OS_TYPE" == "ubuntu" ]]; then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq >/dev/null 2>&1
-        apt-get install -y -qq wget curl openssl jq iptables >/dev/null 2>&1
+        apt-get install -y -qq wget curl openssl jq iptables iproute2 >/dev/null 2>&1
     elif [[ "$OS_TYPE" == "centos" || "$OS_TYPE" == "rhel" || "$OS_TYPE" == "fedora" || "$OS_TYPE" == "rocky" ]]; then
         yum install -y -q epel-release >/dev/null 2>&1
-        yum install -y -q wget curl openssl jq iptables >/dev/null 2>&1
+        yum install -y -q wget curl openssl jq iptables iproute >/dev/null 2>&1
     fi
 }
 
@@ -130,13 +130,19 @@ setup_port_hopping() {
 
     local hop_start=$hy2_port
     echo "正在配置端口跳跃 (Port Hopping: UDP ${hop_start}-${hop_end} -> ${hy2_port})..."
-    mkdir -p /etc/hysteria 2>/dev/null || true
-    echo "${hop_start}:${hop_end}:${hy2_port}" > /etc/hysteria/port_hopping.txt 2>/dev/null || true
+
+    # 尝试切换为 legacy 模式 (部分 LXC 容器对 nf_tables 支持不佳)
+    if [[ "${OS_TYPE:-}" == "debian" || "${OS_TYPE:-}" == "ubuntu" ]]; then
+        update-alternatives --set iptables /usr/sbin/iptables-legacy 2>/dev/null || true
+        update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy 2>/dev/null || true
+    fi
 
     local iptables_ok=0
     if command -v iptables >/dev/null 2>&1; then
         iptables -t nat -D PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports "$hy2_port" 2>/dev/null || true
         if iptables -t nat -A PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports "$hy2_port" 2>/dev/null; then
+            iptables_ok=1
+        elif iptables-legacy -t nat -A PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports "$hy2_port" 2>/dev/null; then
             iptables_ok=1
         fi
     fi
@@ -145,13 +151,18 @@ setup_port_hopping() {
         ip6tables -t nat -D PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports "$hy2_port" 2>/dev/null || true
         if ip6tables -t nat -A PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports "$hy2_port" 2>/dev/null; then
             ip6tables_ok=1
+        elif ip6tables-legacy -t nat -A PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports "$hy2_port" 2>/dev/null; then
+            ip6tables_ok=1
         fi
     fi
 
     if [ "$iptables_ok" -eq 0 ] && [ "$ip6tables_ok" -eq 0 ]; then
-        echo -e "${YELLOW}警告：当前 NAT 环境不支持 iptables/ip6tables REDIRECT 转发，已跳过${RESET}" >&2
+        echo -e "${YELLOW}提示：当前 NAT/容器环境宿主机未开放 iptables NAT 权限，已自动转为纯单端口模式${RESET}" >&2
         return 1
     fi
+
+    mkdir -p /etc/hysteria 2>/dev/null || true
+    echo "${hop_start}:${hop_end}:${hy2_port}" > /etc/hysteria/port_hopping.txt 2>/dev/null || true
     return 0
 }
 
@@ -162,15 +173,33 @@ check_service_health() {
         journalctl --no-pager -u hysteria-server.service -n 20 >&2 || true
         return 1
     fi
+
+    local hex_port
+    hex_port=$(printf '%04X' "$hy2_port" 2>/dev/null || true)
+
     local attempt
     for attempt in 1 2 3 4 5; do
-        if ss -H -lun "sport = :$hy2_port" 2>/dev/null | grep -q ":$hy2_port"; then
+        # 1. ss 检查 (通用)
+        if command -v ss >/dev/null 2>&1 && ss -H -lun "sport = :$hy2_port" 2>/dev/null | grep -q ":$hy2_port"; then
             echo -e "${GREEN}服务健康检查通过：UDP :$hy2_port 正在监听${RESET}"
             return 0
         fi
+        if command -v ss >/dev/null 2>&1 && ss -lun 2>/dev/null | grep -q ":$hy2_port"; then
+            echo -e "${GREEN}服务健康检查通过：UDP :$hy2_port 正在监听${RESET}"
+            return 0
+        fi
+        # 2. 内核 /proc/net/udp(6) 零依赖检查 (适用于无 iproute2 的最小化容器)
+        if [ -n "$hex_port" ]; then
+            if grep -qi ":${hex_port} " /proc/net/udp /proc/net/udp6 2>/dev/null; then
+                echo -e "${GREEN}服务健康检查通过：UDP :$hy2_port 正在监听${RESET}"
+                return 0
+            fi
+        fi
         sleep 1
     done
-    echo -e "${RED}服务已运行但未监听 UDP :$hy2_port${RESET}" >&2
+
+    echo -e "${RED}服务已运行但未检测到 UDP :$hy2_port 正在监听，最近日志：${RESET}" >&2
+    journalctl --no-pager -u hysteria-server.service -n 20 >&2 || true
     return 1
 }
 
@@ -291,7 +320,9 @@ CONFIG
 
     # 7. 配置端口跳跃与启动服务
     if [ -n "$hy2_end_port" ]; then
-        setup_port_hopping "$hy2_port" "$hy2_end_port" || true
+        if ! setup_port_hopping "$hy2_port" "$hy2_end_port"; then
+            hy2_end_port=""
+        fi
     fi
     systemctl enable --now hysteria-server.service >/dev/null 2>&1
     systemctl restart hysteria-server.service
