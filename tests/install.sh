@@ -62,7 +62,7 @@ assert_contains 'congestion:' "$(<"$script_dir/install.sh")" 'generated config r
 assert_contains 'bbrProfile: standard' "$(<"$script_dir/install.sh")" 'generated config retains the validated BBR fallback profile'
 assert_contains 'maxIncomingStreams: 128' "$(<"$script_dir/install.sh")" 'generated config limits concurrent QUIC streams'
 assert_contains 'keepAlivePeriod: 10s' "$(<"$script_dir/install.sh")" 'generated config uses aggressive 10s keepalive to prevent optical modem UDP timeout'
-assert_contains 'maxIdleTimeout: 300s' "$(<"$script_dir/install.sh")" 'generated config permits 300s idle timeout for long reasoning tasks'
+assert_contains 'maxIdleTimeout: 120s' "$(<"$script_dir/install.sh")" 'generated config permits 120s idle timeout'
 assert_contains 'port-hopping=' "$(<"$script_dir/install.sh")" 'installer generates port-hopping node for anti-QoS stability'
 assert_contains '请输入转发末尾端口号' "$(<"$script_dir/install.sh")" 'installer prompts for optional end port'
 assert_contains 'Hysteria2-Agent' "$(<"$script_dir/install.sh")" 'installer labels dedicated agent node'

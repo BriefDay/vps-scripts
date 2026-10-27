@@ -313,7 +313,7 @@ congestion:
 
 quic:
 $(quic_memory_profile "$memory_limit")
-  maxIdleTimeout: 300s
+  maxIdleTimeout: 120s
   maxIncomingStreams: 128
   keepAlivePeriod: 10s
 CONFIG
