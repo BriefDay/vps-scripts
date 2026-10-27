@@ -4,7 +4,7 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 RED='' GREEN='' YELLOW='' RESET=''
 # Load only the resource-profile helper; this avoids package installation and the interactive menu.
-source <(sed -n '/^detect_memory_limit_bytes()/,/^}/p; /^quic_memory_profile()/,/^}/p; /^apply_sysctl_setting()/,/^}/p; /^check_service_health()/,/^}/p' "$script_dir/install.sh")
+source <(sed -n '/^detect_memory_limit_bytes()/,/^}/p; /^quic_memory_profile()/,/^}/p; /^apply_sysctl_setting()/,/^}/p; /^check_service_health()/,/^}/p; /^setup_port_hopping()/,/^}/p' "$script_dir/install.sh")
 
 assert_eq() {
   local expected=$1 actual=$2 message=$3
@@ -63,7 +63,8 @@ assert_contains 'bbrProfile: standard' "$(<"$script_dir/install.sh")" 'generated
 assert_contains 'maxIncomingStreams: 128' "$(<"$script_dir/install.sh")" 'generated config limits concurrent QUIC streams'
 assert_contains 'keepAlivePeriod: 10s' "$(<"$script_dir/install.sh")" 'generated config uses aggressive 10s keepalive to prevent optical modem UDP timeout'
 assert_contains 'maxIdleTimeout: 300s' "$(<"$script_dir/install.sh")" 'generated config permits 300s idle timeout for long reasoning tasks'
-assert_contains 'port-hopping=20000-50000' "$(<"$script_dir/install.sh")" 'installer generates port-hopping node for anti-QoS stability'
+assert_contains 'port-hopping=' "$(<"$script_dir/install.sh")" 'installer generates port-hopping node for anti-QoS stability'
+assert_contains '请输入转发末尾端口号' "$(<"$script_dir/install.sh")" 'installer prompts for optional end port'
 assert_contains 'Hysteria2-Agent' "$(<"$script_dir/install.sh")" 'installer labels dedicated agent node'
 assert_contains 'download-bandwidth=150' "$(<"$script_dir/install.sh")" 'installer prints a Surge Brutal test-node field'
 assert_contains 'Surge 节点' "$(<"$script_dir/install.sh")" 'installer labels its Surge-specific output'
@@ -86,6 +87,31 @@ chmod +x "$fake_bin/systemctl" "$fake_bin/ss"
 health_output=$(PATH="$fake_bin:$PATH" check_service_health 51320 2>&1)
 assert_contains '服务健康检查通过' "$health_output" 'health check tolerates socket startup delay'
 rm -f "${TMPDIR:-/tmp}/hysteria-health-test-state"
+rm -rf "$fake_bin"
+
+# Test setup_port_hopping without end port
+assert_eq "0" "$(setup_port_hopping 39810 "" && echo 0)" 'setup_port_hopping without end port exits immediately with 0'
+
+# Test setup_port_hopping with end port
+fake_bin=$(mktemp -d)
+cat > "$fake_bin/iptables" <<'FAKE_IPTABLES'
+#!/usr/bin/env bash
+echo "iptables called with: $*" >> "${TMPDIR:-/tmp}/iptables.log"
+exit 0
+FAKE_IPTABLES
+cat > "$fake_bin/ip6tables" <<'FAKE_IP6TABLES'
+#!/usr/bin/env bash
+echo "ip6tables called with: $*" >> "${TMPDIR:-/tmp}/ip6tables.log"
+exit 0
+FAKE_IP6TABLES
+chmod +x "$fake_bin/iptables" "$fake_bin/ip6tables"
+rm -f "${TMPDIR:-/tmp}/iptables.log" "${TMPDIR:-/tmp}/ip6tables.log"
+
+PATH="$fake_bin:$PATH" setup_port_hopping 39810 39819 >/dev/null 2>&1 || true
+iptables_calls=$(cat "${TMPDIR:-/tmp}/iptables.log" 2>/dev/null || true)
+assert_contains '39810:39819' "$iptables_calls" 'setup_port_hopping passes custom port range to iptables'
+assert_contains '--to-ports 39810' "$iptables_calls" 'setup_port_hopping redirects to starting port'
+rm -f "${TMPDIR:-/tmp}/iptables.log" "${TMPDIR:-/tmp}/ip6tables.log"
 rm -rf "$fake_bin"
 
 printf 'PASS: install.sh resource profile tests\n'

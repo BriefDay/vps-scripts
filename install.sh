@@ -122,18 +122,37 @@ SYSCTL
 
 setup_port_hopping() {
     local hy2_port=$1
-    local hop_start=20000
-    local hop_end=50000
+    local hop_end=$2
 
+    if [ -z "$hop_end" ]; then
+        return 0
+    fi
+
+    local hop_start=$hy2_port
     echo "正在配置端口跳跃 (Port Hopping: UDP ${hop_start}-${hop_end} -> ${hy2_port})..."
+    mkdir -p /etc/hysteria 2>/dev/null || true
+    echo "${hop_start}:${hop_end}:${hy2_port}" > /etc/hysteria/port_hopping.txt 2>/dev/null || true
+
+    local iptables_ok=0
     if command -v iptables >/dev/null 2>&1; then
         iptables -t nat -D PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports "$hy2_port" 2>/dev/null || true
-        iptables -t nat -A PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports "$hy2_port" 2>/dev/null || true
+        if iptables -t nat -A PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports "$hy2_port" 2>/dev/null; then
+            iptables_ok=1
+        fi
     fi
+    local ip6tables_ok=0
     if command -v ip6tables >/dev/null 2>&1; then
         ip6tables -t nat -D PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports "$hy2_port" 2>/dev/null || true
-        ip6tables -t nat -A PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports "$hy2_port" 2>/dev/null || true
+        if ip6tables -t nat -A PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports "$hy2_port" 2>/dev/null; then
+            ip6tables_ok=1
+        fi
     fi
+
+    if [ "$iptables_ok" -eq 0 ] && [ "$ip6tables_ok" -eq 0 ]; then
+        echo -e "${YELLOW}警告：当前 NAT 环境不支持 iptables/ip6tables REDIRECT 转发，已跳过${RESET}" >&2
+        return 1
+    fi
+    return 0
 }
 
 check_service_health() {
@@ -179,11 +198,26 @@ quick_setup() {
     bash <(curl -fsSL https://get.hy2.sh/) >/dev/null 2>&1
 
     # 2. 交互: 输入端口号
-    local hy2_port
+    local hy2_port hy2_end_port
     while true; do
-        read -p "请输入监听端口号 (1-65535)：" hy2_port
+        read -p "请输入主监听端口号 (1-65535)：" hy2_port
         if [[ "$hy2_port" =~ ^[0-9]+$ ]] && [ "$hy2_port" -ge 1 ] && [ "$hy2_port" -le 65535 ]; then break; fi
         echo -e "${RED}输入有误，请重新输入！${RESET}"
+    done
+
+    while true; do
+        read -p "请输入转发末尾端口号 (可选/直接回车不开启转发)：" hy2_end_port
+        if [ -z "$hy2_end_port" ]; then
+            break
+        elif [[ "$hy2_end_port" =~ ^[0-9]+$ ]] && [ "$hy2_end_port" -ge 1 ] && [ "$hy2_end_port" -le 65535 ]; then
+            if [ "$hy2_end_port" -le "$hy2_port" ]; then
+                echo -e "${RED}末尾端口必须大于主监听端口 (${hy2_port})，请重新输入！${RESET}"
+            else
+                break
+            fi
+        else
+            echo -e "${RED}输入有误，请输入有效的端口号 (1-65535) 或直接按回车跳过！${RESET}"
+        fi
     done
 
     # 3. 自动生成 bing.com 自签证书
@@ -256,20 +290,30 @@ $(quic_memory_profile "$memory_limit")
 CONFIG
 
     # 7. 配置端口跳跃与启动服务
-    setup_port_hopping "$hy2_port" || true
+    if [ -n "$hy2_end_port" ]; then
+        setup_port_hopping "$hy2_port" "$hy2_end_port" || true
+    fi
     systemctl enable --now hysteria-server.service >/dev/null 2>&1
     systemctl restart hysteria-server.service
     check_service_health "$hy2_port" || return 1
 
     # 8. 生成链接
     local encoded_pw=$(urlencode "$hy2_passwd")
-    local link="hysteria2://${encoded_pw}@${hy2_domain}:${hy2_port}?sni=${cert_domain}&insecure=1#Hysteria2"
+    local hop_param=""
+    local mport_param=""
+    local hop_info=""
+    if [ -n "$hy2_end_port" ]; then
+        hop_param=",port-hopping=${hy2_port}-${hy2_end_port},port-hopping-interval=30"
+        mport_param="&mport=${hy2_port}-${hy2_end_port}"
+        hop_info=" (跳跃端口段: ${hy2_port}-${hy2_end_port})"
+    fi
+
+    local link="hysteria2://${encoded_pw}@${hy2_domain}:${hy2_port}?sni=${cert_domain}&insecure=1${mport_param}#Hysteria2"
     echo "$link" > "$HY2_URL_SCHEME"
 
     echo ""
     echo -e "${GREEN}========== Hysteria2 安装配置完成！==========${RESET}"
-    echo -e "  主监听端口: ${hy2_port}"
-    echo -e "  跳跃端口段: 20000-50000 (防运营商 UDP QoS 降速)"
+    echo -e "  主监听端口: ${hy2_port}${hop_info}"
     echo -e "  密码: ${hy2_passwd}"
     echo -e "  IPv4: ${ipv4_addr:-无}"
     echo -e "  IPv6: ${ipv6_addr:-无}"
@@ -278,12 +322,12 @@ CONFIG
     echo ""
     echo -e "${RED}hy2 链接: ${link}${RESET}"
     echo -e "${YELLOW}提示：通用 hy2 链接不含 Brutal 带宽参数；Surge 请使用下方节点。${RESET}"
-    echo -e "${RED}Surge 节点 (测速/下载 Brutal): Hysteria2 = hysteria2,${hy2_domain},${hy2_port},password=\"${hy2_passwd}\",sni=\"${cert_domain}\",skip-cert-verify=true,download-bandwidth=150${RESET}"
-    echo -e "${GREEN}Surge 节点 (AI Agent 稳定防断流 BBR): Hysteria2-Agent = hysteria2,${hy2_domain},${hy2_port},password=\"${hy2_passwd}\",sni=\"${cert_domain}\",skip-cert-verify=true,port-hopping=20000-50000,port-hopping-interval=30${RESET}"
+    echo -e "${RED}Surge 节点 (测速/下载 Brutal): Hysteria2 = hysteria2,${hy2_domain},${hy2_port},password=\"${hy2_passwd}\",sni=\"${cert_domain}\",skip-cert-verify=true,download-bandwidth=150${hop_param}${RESET}"
+    echo -e "${GREEN}Surge 节点 (AI Agent 稳定防断流 BBR): Hysteria2-Agent = hysteria2,${hy2_domain},${hy2_port},password=\"${hy2_passwd}\",sni=\"${cert_domain}\",skip-cert-verify=true${hop_param}${RESET}"
     if [ -n "$ipv4_addr" ] && [ -n "$ipv6_addr" ]; then
-        local link_v6="hysteria2://${encoded_pw}@[${ipv6_addr}]:${hy2_port}?sni=${cert_domain}&insecure=1#Hysteria2-IPv6"
+        local link_v6="hysteria2://${encoded_pw}@[${ipv6_addr}]:${hy2_port}?sni=${cert_domain}&insecure=1${mport_param}#Hysteria2-IPv6"
         echo -e "${RED}IPv6 链接: ${link_v6}${RESET}"
-        echo -e "${GREEN}Surge IPv6 (AI Agent 稳定防断流 BBR): Hysteria2-IPv6-Agent = hysteria2,[${ipv6_addr}],${hy2_port},password=\"${hy2_passwd}\",sni=\"${cert_domain}\",skip-cert-verify=true,port-hopping=20000-50000,port-hopping-interval=30${RESET}"
+        echo -e "${GREEN}Surge IPv6 (AI Agent 稳定防断流 BBR): Hysteria2-IPv6-Agent = hysteria2,[${ipv6_addr}],${hy2_port},password=\"${hy2_passwd}\",sni=\"${cert_domain}\",skip-cert-verify=true${hop_param}${RESET}"
     fi
     echo ""
 }
@@ -294,6 +338,18 @@ hysteria2_uninstall() {
         bash <(curl -fsSL https://get.hy2.sh/) --remove >/dev/null 2>&1
         rm -rf /etc/hysteria "$SSL_DIR" /etc/sysctl.d/99-hysteria2.conf /usr/local/bin/hy2
         # 清理端口跳跃规则与残留服务
+        if [ -f /etc/hysteria/port_hopping.txt ]; then
+            IFS=':' read -r saved_start saved_end saved_target < /etc/hysteria/port_hopping.txt 2>/dev/null || true
+            if [ -n "$saved_start" ] && [ -n "$saved_end" ]; then
+                if command -v iptables >/dev/null 2>&1; then
+                    iptables -t nat -D PREROUTING -p udp --dport ${saved_start}:${saved_end} -j REDIRECT 2>/dev/null || true
+                fi
+                if command -v ip6tables >/dev/null 2>&1; then
+                    ip6tables -t nat -D PREROUTING -p udp --dport ${saved_start}:${saved_end} -j REDIRECT 2>/dev/null || true
+                fi
+            fi
+            rm -f /etc/hysteria/port_hopping.txt
+        fi
         if command -v iptables >/dev/null 2>&1; then
             iptables -t nat -D PREROUTING -p udp --dport 20000:50000 -j REDIRECT 2>/dev/null || true
         fi
