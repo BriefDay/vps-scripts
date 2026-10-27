@@ -31,10 +31,10 @@ install_packages() {
     if [[ "$OS_TYPE" == "debian" || "$OS_TYPE" == "ubuntu" ]]; then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq >/dev/null 2>&1
-        apt-get install -y -qq wget curl openssl jq >/dev/null 2>&1
+        apt-get install -y -qq wget curl openssl jq iptables >/dev/null 2>&1
     elif [[ "$OS_TYPE" == "centos" || "$OS_TYPE" == "rhel" || "$OS_TYPE" == "fedora" || "$OS_TYPE" == "rocky" ]]; then
         yum install -y -q epel-release >/dev/null 2>&1
-        yum install -y -q wget curl openssl jq >/dev/null 2>&1
+        yum install -y -q wget curl openssl jq iptables >/dev/null 2>&1
     fi
 }
 
@@ -100,10 +100,15 @@ net.ipv4.tcp_wmem = 4096 65536 4194304
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 30
 net.ipv4.tcp_max_syn_backlog = 4096
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.tcp_keepalive_probes = 5
 net.core.somaxconn = 4096
 net.netfilter.nf_conntrack_max = 65535
 net.netfilter.nf_conntrack_tcp_timeout_established = 1200
 net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
+net.ipv6.conf.all.forwarding = 1
+net.ipv6.conf.default.forwarding = 1
 SYSCTL
 
     while IFS=' = ' read -r key value; do
@@ -112,6 +117,22 @@ SYSCTL
 
     if [ "$memory_limit" -gt 0 ] && [ "$memory_limit" -le $((512 * 1024 * 1024)) ]; then
         echo -e "${YELLOW}检测到内存限制 $((memory_limit / 1024 / 1024)) MiB，将使用小内存 QUIC 配置${RESET}"
+    fi
+}
+
+setup_port_hopping() {
+    local hy2_port=$1
+    local hop_start=20000
+    local hop_end=50000
+
+    echo "正在配置端口跳跃 (Port Hopping: UDP ${hop_start}-${hop_end} -> ${hy2_port})..."
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -t nat -D PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports "$hy2_port" 2>/dev/null || true
+        iptables -t nat -A PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports "$hy2_port" 2>/dev/null || true
+    fi
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -t nat -D PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports "$hy2_port" 2>/dev/null || true
+        ip6tables -t nat -A PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports "$hy2_port" 2>/dev/null || true
     fi
 }
 
@@ -229,12 +250,13 @@ congestion:
 
 quic:
 $(quic_memory_profile "$memory_limit")
-  maxIdleTimeout: 120s
+  maxIdleTimeout: 300s
   maxIncomingStreams: 128
-  keepAlivePeriod: 30s
+  keepAlivePeriod: 10s
 CONFIG
 
-    # 7. 启动服务
+    # 7. 配置端口跳跃与启动服务
+    setup_port_hopping "$hy2_port" || true
     systemctl enable --now hysteria-server.service >/dev/null 2>&1
     systemctl restart hysteria-server.service
     check_service_health "$hy2_port" || return 1
@@ -246,19 +268,22 @@ CONFIG
 
     echo ""
     echo -e "${GREEN}========== Hysteria2 安装配置完成！==========${RESET}"
-    echo -e "  端口: ${hy2_port}"
+    echo -e "  主监听端口: ${hy2_port}"
+    echo -e "  跳跃端口段: 20000-50000 (防运营商 UDP QoS 降速)"
     echo -e "  密码: ${hy2_passwd}"
     echo -e "  IPv4: ${ipv4_addr:-无}"
     echo -e "  IPv6: ${ipv6_addr:-无}"
     echo -e "  证书: bing.com 自签"
-    echo -e "  QUIC: 已按内存限制适配；Brutal 下载限速 150 Mbps"
+    echo -e "  QUIC: 已适配内存限制；保活心跳: 10s (防光猫会话超时)"
     echo ""
     echo -e "${RED}hy2 链接: ${link}${RESET}"
     echo -e "${YELLOW}提示：通用 hy2 链接不含 Brutal 带宽参数；Surge 请使用下方节点。${RESET}"
-    echo -e "${RED}Surge 节点: Hysteria2 = hysteria2,${hy2_domain},${hy2_port},password=\"${hy2_passwd}\",sni=\"${cert_domain}\",skip-cert-verify=true,download-bandwidth=150${RESET}"
+    echo -e "${RED}Surge 节点 (测速/下载 Brutal): Hysteria2 = hysteria2,${hy2_domain},${hy2_port},password=\"${hy2_passwd}\",sni=\"${cert_domain}\",skip-cert-verify=true,download-bandwidth=150${RESET}"
+    echo -e "${GREEN}Surge 节点 (AI Agent 稳定防断流 BBR): Hysteria2-Agent = hysteria2,${hy2_domain},${hy2_port},password=\"${hy2_passwd}\",sni=\"${cert_domain}\",skip-cert-verify=true,port-hopping=20000-50000,port-hopping-interval=30${RESET}"
     if [ -n "$ipv4_addr" ] && [ -n "$ipv6_addr" ]; then
         local link_v6="hysteria2://${encoded_pw}@[${ipv6_addr}]:${hy2_port}?sni=${cert_domain}&insecure=1#Hysteria2-IPv6"
         echo -e "${RED}IPv6 链接: ${link_v6}${RESET}"
+        echo -e "${GREEN}Surge IPv6 (AI Agent 稳定防断流 BBR): Hysteria2-IPv6-Agent = hysteria2,[${ipv6_addr}],${hy2_port},password=\"${hy2_passwd}\",sni=\"${cert_domain}\",skip-cert-verify=true,port-hopping=20000-50000,port-hopping-interval=30${RESET}"
     fi
     echo ""
 }
@@ -268,7 +293,13 @@ hysteria2_uninstall() {
     if [[ "$choice" == "y" || "$choice" == "Y" ]]; then
         bash <(curl -fsSL https://get.hy2.sh/) --remove >/dev/null 2>&1
         rm -rf /etc/hysteria "$SSL_DIR" /etc/sysctl.d/99-hysteria2.conf /usr/local/bin/hy2
-        # 清理可能残留的 iptables 规则和脚本 (兼容老版本)
+        # 清理端口跳跃规则与残留服务
+        if command -v iptables >/dev/null 2>&1; then
+            iptables -t nat -D PREROUTING -p udp --dport 20000:50000 -j REDIRECT 2>/dev/null || true
+        fi
+        if command -v ip6tables >/dev/null 2>&1; then
+            ip6tables -t nat -D PREROUTING -p udp --dport 20000:50000 -j REDIRECT 2>/dev/null || true
+        fi
         rm -rf /etc/hy2config
         systemctl stop hysteria-iptables.service 2>/dev/null
         systemctl disable hysteria-iptables.service 2>/dev/null
