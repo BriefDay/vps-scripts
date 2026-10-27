@@ -23,10 +23,10 @@ assert_contains() {
 }
 
 small_profile=$(quic_memory_profile 268435456)
-assert_contains 'initStreamReceiveWindow: 2097152' "$small_profile" '256 MiB uses a small stream receive window'
-assert_contains 'maxStreamReceiveWindow: 4194304' "$small_profile" '256 MiB caps the stream receive window'
-assert_contains 'initConnReceiveWindow: 8388608' "$small_profile" '256 MiB uses a bounded connection receive window'
-assert_contains 'maxConnReceiveWindow: 8388608' "$small_profile" '256 MiB caps the connection receive window'
+assert_contains 'initStreamReceiveWindow: 524288' "$small_profile" '256 MiB uses a small stream receive window'
+assert_contains 'maxStreamReceiveWindow: 1048576' "$small_profile" '256 MiB caps the stream receive window'
+assert_contains 'initConnReceiveWindow: 1048576' "$small_profile" '256 MiB uses a bounded connection receive window'
+assert_contains 'maxConnReceiveWindow: 2097152' "$small_profile" '256 MiB caps the connection receive window'
 
 large_profile=$(quic_memory_profile 1073741824)
 assert_contains 'initStreamReceiveWindow: 8388608' "$large_profile" 'larger VPS keeps the standard stream window'

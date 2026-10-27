@@ -53,10 +53,10 @@ quic_memory_profile() {
     local memory_limit_bytes=${1:-0}
     if [ "$memory_limit_bytes" -gt 0 ] && [ "$memory_limit_bytes" -le $((512 * 1024 * 1024)) ]; then
         cat <<'PROFILE'
-  initStreamReceiveWindow: 2097152
-  maxStreamReceiveWindow: 4194304
-  initConnReceiveWindow: 8388608
-  maxConnReceiveWindow: 8388608
+  initStreamReceiveWindow: 524288
+  maxStreamReceiveWindow: 1048576
+  initConnReceiveWindow: 1048576
+  maxConnReceiveWindow: 2097152
 PROFILE
     else
         cat <<'PROFILE'
