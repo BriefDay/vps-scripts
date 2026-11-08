@@ -1,0 +1,4 @@
+*.orig
+__pycache__/
+*.pyc
+deploy_remote.py
